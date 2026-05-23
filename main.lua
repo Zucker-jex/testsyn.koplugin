@@ -25,13 +25,14 @@ end
 
 function TestSyncPlugin:addToMainMenu(menu_items)
     menu_items.test_sync_plugin = {
-        text = "测试同步",
+        text = "书库同步",   -- 主菜单入口文本
         sorting_hint = "tools",
         sub_item_table = {
             {
+                -- 远程服务器设置项：动态显示当前配置或提示设置
                 text_func = function()
                     if self.settings.remote_server and self.settings.remote_server.url then
-                        return "远程目录: " .. self.settings.remote_server.url
+                        return "远程目录：" .. self.settings.remote_server.url
                     else
                         return "设置远程目录"
                     end
@@ -53,9 +54,10 @@ function TestSyncPlugin:addToMainMenu(menu_items)
                 end
             },
             {
+                -- 本地目录设置项
                 text_func = function()
                     if self.settings.local_dir then
-                        return "本地目录: " .. self.settings.local_dir
+                        return "本地目录：" .. self.settings.local_dir
                     else
                         return "设置本地目录"
                     end
@@ -71,7 +73,7 @@ function TestSyncPlugin:addToMainMenu(menu_items)
                                 self.settings.local_dir = path
                                 G_reader_settings:saveSetting("test_sync_plugin", self.settings)
                                 UIManager:show(Notification:new{
-                                    text = "本地目录已设置: " .. path,
+                                    text = "本地目录已设置为：" .. path,
                                     timeout = 2
                                 })
                             end
@@ -89,9 +91,7 @@ function TestSyncPlugin:addToMainMenu(menu_items)
     }
 end
 
---- 获取对应云存储类型的 API 实例
--- @param server 服务器配置表，包含 type 字段
--- @return API 模块或 nil
+-- 根据云存储类型获取对应的 API 模块
 function TestSyncPlugin:get_api(server)
     if server.type == "dropbox" then
         return require("apps/cloudstorage/dropboxapi")
@@ -101,15 +101,56 @@ function TestSyncPlugin:get_api(server)
     return nil
 end
 
---- 下载远程根目录的 index.json，并根据用户设置的远程子目录过滤文件列表（仅 WebDAV 使用）
--- @param server 服务器配置表，需包含 address, username, password, url（远程子目录）
--- @param api WebDAV API 实例
--- @return 过滤后的文件列表（表数组，每个元素含 path, size, full_path），以及错误信息（若失败）
+-- 递归创建目录（兼容不支持 mkdir -p 的环境）
+-- 优先使用系统命令 mkdir -p，回退到 Lua 递归创建
+function TestSyncPlugin:mkdir_p(path)
+    if not path or path == "" then
+        return
+    end
+    if lfs.attributes(path, "mode") == "directory" then
+        return
+    end
+
+    -- 检测系统是否支持 mkdir -p（仅检测一次）
+    if self._can_use_mkdir_p == nil then
+        local test_dir = DataStorage:getDataDir() .. "/.mkdir_test"
+        os.execute("mkdir -p " .. string.format("%q", test_dir) .. " 2>/dev/null")
+        if lfs.attributes(test_dir, "mode") == "directory" then
+            os.execute("rmdir " .. string.format("%q", test_dir))
+            self._can_use_mkdir_p = true
+        else
+            self._can_use_mkdir_p = false
+        end
+    end
+
+    if self._can_use_mkdir_p then
+        -- 使用系统原生的 mkdir -p（速度快）
+        os.execute("mkdir -p " .. string.format("%q", path))
+    else
+        -- 回退到纯 Lua 递归创建（兼容安卓等受限环境）
+        local parent = path:match("^(.*)/[^/]+$")
+        if parent then
+            self:mkdir_p(parent)
+        end
+        local ok, err = lfs.mkdir(path)
+        if not ok and lfs.attributes(path, "mode") ~= "directory" then
+            logger.warn("TestSync: mkdir failed " .. path .. " " .. tostring(err))
+        end
+    end
+end
+
+-- 获取并过滤 WebDAV 根目录的 index.json 索引文件
+-- 返回 { 过滤后的文件列表, 错误信息 }
 function TestSyncPlugin:fetchAndFilterWebDAVIndex(server, api)
+    -- 使用 KOReader 私有数据目录存放临时文件（安卓兼容）
+    local data_dir = DataStorage:getDataDir()
+    local tmp_dir = data_dir .. "/tmp"
+    self:mkdir_p(tmp_dir)
+    local temp_file = tmp_dir .. "/koreader_index.json"
+
     local index_remote_path = "/index.json"
     local root_url = server.address
     local index_full_url = api:getJoinedPath(root_url, index_remote_path)
-    local temp_file = "/tmp/koreader_index.json"
 
     local code = api:downloadFile(index_full_url, server.username, server.password, temp_file, nil)
     if code ~= 200 and code ~= 201 and code ~= 206 then
@@ -129,7 +170,7 @@ function TestSyncPlugin:fetchAndFilterWebDAVIndex(server, api)
         return nil, "索引文件 index.json 格式错误"
     end
 
-    -- 规范化远程子目录：去除首尾斜杠，末尾保留斜杠，空字符串表示根目录
+    -- 规范化远程子目录（无前导斜杠，末尾有斜杠，空字符串表示根目录）
     local remote_subdir = server.url or ""
     if remote_subdir == "" or remote_subdir == "/" then
         remote_subdir = ""
@@ -145,9 +186,8 @@ function TestSyncPlugin:fetchAndFilterWebDAVIndex(server, api)
     local filtered = {}
     for _, item in ipairs(data) do
         if item.type == "file" and item.path then
-            local full_path = item.path  -- 例如 "ebook/xxx.epub"
+            local full_path = item.path
             if remote_subdir == "" then
-                -- 根目录模式：包含所有文件
                 table.insert(filtered, {
                     path = full_path,
                     size = item.size,
@@ -171,7 +211,7 @@ function TestSyncPlugin:fetchAndFilterWebDAVIndex(server, api)
     return filtered, nil
 end
 
---- 主同步入口：校验设置，根据云存储类型选择对应同步方法
+-- 开始同步流程
 function TestSyncPlugin:startSync()
     local server = self.settings.remote_server
     local local_dir = self.settings.local_dir
@@ -190,7 +230,7 @@ function TestSyncPlugin:startSync()
         return
     end
 
-    -- WebDAV 模式：使用预生成的 index.json 并支持子目录过滤
+    -- WebDAV 模式：使用预生成的 index.json
     if server.type == "webdav" then
         local fetch_notification = Notification:new{text = "正在读取索引文件 index.json ..."}
         UIManager:show(fetch_notification)
@@ -201,16 +241,16 @@ function TestSyncPlugin:startSync()
 
             if not filtered_items then
                 UIManager:show(InfoMessage:new{
-                    text = "未找到 index.json 或索引文件错误。请在 WebDAV 根目录运行 Python 脚本生成索引文件。",
+                    text = "未找到 index.json 或索引文件格式错误。请在 WebDAV 根目录运行 Python 脚本生成索引文件。",
                     timeout = 5
                 })
                 return
             end
 
-            -- 构建待下载列表（比较文件大小）
+            -- 构建下载列表（比较文件大小决定是否需要下载）
             local download_list = {}
             for _, item in ipairs(filtered_items) do
-                local rel_path = item.path          -- 相对于用户设置的远程子目录
+                local rel_path = item.path
                 local local_path = local_dir .. "/" .. rel_path
                 local_path = local_path:gsub("//+", "/")
                 local remote_size = tonumber(item.size) or -1
@@ -218,12 +258,12 @@ function TestSyncPlugin:startSync()
 
                 if not local_size or (remote_size ~= -1 and local_size ~= remote_size) then
                     table.insert(download_list, {
-                        cloud_path = item.full_path,   -- 完整路径（相对于根目录），用于下载
+                        cloud_path = item.full_path,
                         target_path = local_path,
                         filename = rel_path:match("([^/]+)$") or rel_path
                     })
                 else
-                    logger.info("TestSync: 跳过 " .. local_path .. " (文件大小相同)")
+                    logger.info("TestSync: skipped " .. local_path .. " (same size)")
                 end
             end
 
@@ -237,7 +277,7 @@ function TestSyncPlugin:startSync()
         return
     end
 
-    -- Dropbox 模式：使用实时遍历方式
+    -- Dropbox 模式：原有实时遍历逻辑
     if server.type == "dropbox" then
         self:syncDropboxLegacy(server, api, local_dir)
     else
@@ -245,10 +285,7 @@ function TestSyncPlugin:startSync()
     end
 end
 
---- Dropbox 同步逻辑（保持原有实时遍历方式）
--- @param server 服务器配置
--- @param api Dropbox API 实例
--- @param local_dir 本地目录路径
+-- Dropbox 原有遍历逻辑（递归列出文件夹内容）
 function TestSyncPlugin:syncDropboxLegacy(server, api, local_dir)
     local fetch_notification = Notification:new{text = "正在获取远程文件列表..."}
     UIManager:show(fetch_notification)
@@ -264,7 +301,7 @@ function TestSyncPlugin:syncDropboxLegacy(server, api, local_dir)
             local items = api:listFolder(remote_folder, token, false)
 
             if not items or type(items) ~= "table" then
-                logger.warn("TestSync: 列出目录失败 " .. tostring(remote_folder))
+                logger.warn("TestSync: failed to list folder " .. tostring(remote_folder))
                 return
             end
 
@@ -288,7 +325,7 @@ function TestSyncPlugin:syncDropboxLegacy(server, api, local_dir)
                                 filename = clean_filename
                             })
                         else
-                            logger.info("TestSync: 跳过 " .. target_path .. " (文件大小相同)")
+                            logger.info("TestSync: skipped " .. target_path .. " (same size)")
                         end
                     end
                 end
@@ -307,10 +344,7 @@ function TestSyncPlugin:syncDropboxLegacy(server, api, local_dir)
     end)
 end
 
---- 显示文件选择对话框，用户可勾选需要下载的文件
--- @param download_list 待下载文件信息列表（含 cloud_path, target_path, filename）
--- @param server 服务器配置
--- @param api API 实例
+-- 通用文件选择对话框（分页、全选等）
 function TestSyncPlugin:showSelectionDialog(download_list, server, api)
     local function show_dialog(page, selected_states)
         local ButtonDialog = require("ui/widget/buttondialog")
@@ -380,7 +414,7 @@ function TestSyncPlugin:showSelectionDialog(download_list, server, api)
                 end
             },
             {
-                text = "全不选",
+                text = "取消全选",
                 callback = function()
                     for i = 1, #download_list do selected_states[i] = false end
                     if dialog then UIManager:close(dialog) end
@@ -397,7 +431,7 @@ function TestSyncPlugin:showSelectionDialog(download_list, server, api)
                 end
             },
             {
-                text = string.format("开始同步 (%d 个文件)", selected_count),
+                text = string.format("开始同步 (%d)", selected_count),
                 callback = function()
                     if dialog then UIManager:close(dialog) end
                     local final_list = {}
@@ -423,16 +457,13 @@ function TestSyncPlugin:showSelectionDialog(download_list, server, api)
     end
 
     local initial_states = {}
-    for i = 1, #download_list do initial_states[i] = true end
+    for i = 1, #download_list do initial_states[i] = false end
     show_dialog(1, initial_states)
 end
 
---- 执行下载：创建父目录，显示进度条，依次下载选中的文件
--- @param download_list 需要下载的文件列表
--- @param server 服务器配置
--- @param api API 实例
+-- 执行下载（批量，带进度条）
 function TestSyncPlugin:executeDownload(download_list, server, api)
-    -- 创建所有需要下载的文件的父目录
+    -- 创建所有被选中文件所需的父目录（使用纯 Lua 递归创建，兼容安卓）
     local parent_dirs = {}
     for _, file_info in ipairs(download_list) do
         local target_path = file_info.target_path
@@ -445,9 +476,7 @@ function TestSyncPlugin:executeDownload(download_list, server, api)
         parent_dirs[self.settings.local_dir] = true
     end
     for dir, _ in pairs(parent_dirs) do
-        if lfs.attributes(dir, "mode") ~= "directory" then
-            os.execute("mkdir -p " .. string.format("%q", dir))
-        end
+        self:mkdir_p(dir)
     end
 
     local ProgressbarDialog = require("ui/widget/progressbardialog")
@@ -490,16 +519,15 @@ function TestSyncPlugin:executeDownload(download_list, server, api)
                 end
                 code = api:downloadFile(file_info.cloud_path, token, file_info.target_path, nil)
             elseif server.type == "webdav" then
-                -- 使用完整路径（相对于 WebDAV 根目录）进行下载
                 local download_url = api:getJoinedPath(server.address, file_info.cloud_path)
                 code = api:downloadFile(download_url, server.username, server.password, file_info.target_path, nil)
             end
 
             if code == 200 or code == 201 or code == 207 or code == 206 then
-                logger.info("TestSync: 已下载 " .. file_info.target_path)
+                logger.info("TestSync: downloaded " .. file_info.target_path)
                 success_count = success_count + 1
             else
-                logger.warn("TestSync: 下载失败 " .. tostring(file_info.filename) .. "，HTTP 状态码 " .. tostring(code))
+                logger.warn("TestSync: failed " .. tostring(file_info.filename) .. ", code " .. tostring(code))
             end
 
             current_idx = current_idx + 1
